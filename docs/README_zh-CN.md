@@ -155,7 +155,7 @@ OPTIMIZE_RESULT=false
 
 ```bash
 alias whisper_input='cd /path/to/Whisper-Input-Next && ./start.sh'
-alias whisper_input_off='tmux kill-session -t whisper-input'
+alias whisper_input_off='cd /path/to/Whisper-Input-Next && ./stop.sh'
 ```
 
 请将 `/path/to/Whisper-Input-Next` 替换为你的项目实际路径。

@@ -194,7 +194,7 @@ Add these aliases to your shell profile (`~/.bashrc`, `~/.zshrc`, etc.):
 
 ```bash
 alias whisper_input='cd /path/to/Whisper-Input-Next && ./start.sh'
-alias whisper_input_off='tmux kill-session -t whisper-input'
+alias whisper_input_off='cd /path/to/Whisper-Input-Next && ./stop.sh'
 ```
 
 Replace `/path/to/Whisper-Input-Next` with your actual project path.
