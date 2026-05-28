@@ -14,6 +14,7 @@ import struct
 import gzip
 import uuid
 import logging
+import time
 from typing import Optional, Callable, AsyncGenerator
 from dataclasses import dataclass
 
@@ -24,6 +25,15 @@ from ..utils.logger import logger
 # 常量定义
 DEFAULT_SAMPLE_RATE = 16000
 SEGMENT_DURATION_MS = 100  # 每包音频时长（毫秒）
+DEFAULT_RECEIVE_TIMEOUT_SECONDS = 1.0
+DEFAULT_RESOURCE_ID = "volc.seedasr.sauc.duration"
+
+
+def _get_bool_env(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in ("1", "true", "yes", "on")
 
 
 class ProtocolVersion:
@@ -67,8 +77,13 @@ class DoubaoStreamingProcessor:
     """豆包流式语音识别处理器"""
 
     def __init__(self):
-        self.app_key = os.getenv("DOUBAO_APP_KEY", "")
-        self.access_key = os.getenv("DOUBAO_ACCESS_KEY", "")
+        self.api_key = os.getenv("DOUBAO_API_KEY", "").strip()
+        self.app_key = os.getenv("DOUBAO_APP_KEY", "").strip()
+        self.access_key = os.getenv("DOUBAO_ACCESS_KEY", "").strip()
+        self.resource_id = self._resolve_resource_id(
+            os.getenv("DOUBAO_RESOURCE_ID", DEFAULT_RESOURCE_ID).strip()
+        )
+        self.ssd_version = os.getenv("DOUBAO_SSD_VERSION", "").strip()
         # 使用优化版双向流式接口
         self.ws_url = "wss://openspeech.bytedance.com/api/v3/sauc/bigmodel_async"
 
@@ -77,13 +92,53 @@ class DoubaoStreamingProcessor:
         self._seq = 1
         self._is_connected = False
         self._sample_rate = DEFAULT_SAMPLE_RATE  # 默认采样率，会在连接时更新
+        self.enable_nonstream = _get_bool_env("DOUBAO_ENABLE_NONSTREAM", True)
+        self.receive_timeout_seconds = DEFAULT_RECEIVE_TIMEOUT_SECONDS
 
-        if not self.app_key or not self.access_key:
-            logger.warning("豆包 API Key 未配置，请设置 DOUBAO_APP_KEY 和 DOUBAO_ACCESS_KEY")
+        if not self.is_available():
+            logger.warning("豆包 API Key 未配置，请设置 DOUBAO_API_KEY，或旧版 DOUBAO_APP_KEY 和 DOUBAO_ACCESS_KEY")
+
+    def _request_ssd_version(self) -> str:
+        if self.ssd_version:
+            return self.ssd_version
+        return "200"
+
+    def _resolve_resource_id(self, resource_id: str) -> str:
+        resource_id = resource_id or DEFAULT_RESOURCE_ID
+        if resource_id.startswith("volc.seedasr.sauc."):
+            return resource_id
+        logger.warning(
+            "仅支持豆包流式 ASR 2.0 resource_id，"
+            f"忽略 {resource_id!r}，使用 {DEFAULT_RESOURCE_ID}"
+        )
+        return DEFAULT_RESOURCE_ID
 
     def is_available(self) -> bool:
         """检查是否可用（API Key 是否配置）"""
-        return bool(self.app_key and self.access_key)
+        return bool(self._auth_header_candidates())
+
+    def _auth_header_candidates(self) -> list[tuple[str, dict[str, str]]]:
+        candidates: list[tuple[str, dict[str, str]]] = []
+        seen_api_keys: set[str] = set()
+
+        def add_api_key(env_name: str, value: str):
+            if not value or value in seen_api_keys:
+                return
+            seen_api_keys.add(value)
+            candidates.append((f"X-Api-Key:{env_name}", {"X-Api-Key": value}))
+
+        add_api_key("DOUBAO_API_KEY", self.api_key)
+
+        if self.app_key and self.access_key:
+            candidates.append((
+                "legacy-app-access",
+                {
+                    "X-Api-App-Key": self.app_key,
+                    "X-Api-Access-Key": self.access_key,
+                },
+            ))
+
+        return candidates
 
     def _gzip_compress(self, data: bytes) -> bytes:
         return gzip.compress(data)
@@ -131,9 +186,12 @@ class DoubaoStreamingProcessor:
                 "enable_ddc": True,      # 语义顺滑
                 "show_utterances": True, # 显示分句信息
                 "result_type": "full",   # 全量返回
-                "enable_nonstream": True # 二遍识别：停顿时用 nostream 模型重新识别该句，提升准确率
+                "enable_nonstream": self.enable_nonstream # 二遍识别：停顿时用 nostream 模型重新识别该句，提升准确率
             }
         }
+        ssd_version = self._request_ssd_version()
+        if ssd_version:
+            payload["request"]["ssd_version"] = ssd_version
 
         payload_bytes = json.dumps(payload).encode('utf-8')
         compressed_payload = self._gzip_compress(payload_bytes)
@@ -269,33 +327,43 @@ class DoubaoStreamingProcessor:
 
         return result
 
+    def _resource_candidates(self) -> list[str]:
+        return [self.resource_id]
+
     async def connect(self) -> bool:
         """建立 WebSocket 连接"""
         if not self.is_available():
             logger.error("豆包 API Key 未配置")
             return False
 
-        try:
-            self._session = aiohttp.ClientSession()
-            headers = {
-                "X-Api-Resource-Id": "volc.seedasr.sauc.duration",  # 2.0版本小时版
-                "X-Api-Connect-Id": str(uuid.uuid4()),
-                "X-Api-Access-Key": self.access_key,
-                "X-Api-App-Key": self.app_key
-            }
+        auth_candidates = self._auth_header_candidates()
+        self._session = aiohttp.ClientSession()
+        for resource_id in self._resource_candidates():
+            for auth_label, auth_headers in auth_candidates:
+                request_id = str(uuid.uuid4())
+                headers = {
+                    "X-Api-Resource-Id": resource_id,
+                    "X-Api-Request-Id": request_id,
+                    "X-Api-Connect-Id": request_id,
+                    **auth_headers,
+                }
 
-            self._ws = await self._session.ws_connect(
-                self.ws_url,
-                headers=headers
-            )
-            self._is_connected = True
-            self._seq = 1
-            logger.info("豆包流式 ASR 连接成功")
-            return True
-        except Exception as e:
-            logger.error(f"连接豆包 ASR 失败: {e}")
-            await self.disconnect()
-            return False
+                try:
+                    self._ws = await self._session.ws_connect(
+                        self.ws_url,
+                        headers=headers
+                    )
+                    self._is_connected = True
+                    self._seq = 1
+                    self.resource_id = resource_id
+                    logger.info(f"豆包流式 ASR 连接成功 (resource_id={resource_id}, auth={auth_label})")
+                    return True
+                except Exception as e:
+                    logger.warning(f"连接豆包 ASR 失败 (resource_id={resource_id}, auth={auth_label}): {e}")
+
+        logger.error("豆包 ASR 2.0 连接失败")
+        await self.disconnect()
+        return False
 
     async def disconnect(self):
         """断开连接"""
@@ -345,13 +413,16 @@ class DoubaoStreamingProcessor:
             logger.error(f"发送音频块失败: {e}")
             return False
 
-    async def receive_result(self) -> Optional[StreamingResult]:
+    async def receive_result(self, timeout: Optional[float] = None) -> Optional[StreamingResult]:
         """接收识别结果"""
         if not self._ws:
             return None
 
         try:
-            msg = await asyncio.wait_for(self._ws.receive(), timeout=5.0)
+            msg = await asyncio.wait_for(
+                self._ws.receive(),
+                timeout=timeout or self.receive_timeout_seconds,
+            )
             if msg.type == aiohttp.WSMsgType.BINARY:
                 return self._parse_response(msg.data)
             elif msg.type == aiohttp.WSMsgType.CLOSED:
@@ -391,10 +462,13 @@ class DoubaoStreamingProcessor:
         """
         self._sample_rate = sample_rate
         logger.info(f"使用采样率: {sample_rate}Hz")
+        logger.info(f"豆包流式配置: enable_nonstream={self.enable_nonstream}")
 
         # 确保旧连接已清理
         if self._is_connected or self._ws or self._session:
             await self.disconnect()
+
+        stream_started_at = time.monotonic()
 
         if not await self.connect():
             on_error("连接失败")
@@ -408,11 +482,12 @@ class DoubaoStreamingProcessor:
                 return
 
             final_text = ""
+            send_done_at: Optional[float] = None
 
             # 启动发送任务
             chunk_count = 0
             async def sender():
-                nonlocal chunk_count
+                nonlocal chunk_count, send_done_at
                 logger.info("📤 开始发送音频...")
                 async for chunk in audio_chunk_generator:
                     chunk_count += 1
@@ -420,7 +495,9 @@ class DoubaoStreamingProcessor:
                     await self.send_audio_chunk(chunk, is_last=False)
                 # 发送最后一包
                 logger.info(f"📤 发送完成，共 {chunk_count} 个音频块，发送结束标记")
-                await self.send_audio_chunk(b"", is_last=True)
+                if not await self.send_audio_chunk(b"", is_last=True):
+                    raise RuntimeError("发送豆包结束标记失败")
+                send_done_at = time.monotonic()
 
             # 启动接收任务
             recv_count = 0
@@ -429,8 +506,9 @@ class DoubaoStreamingProcessor:
             async def receiver():
                 nonlocal final_text, recv_count, consecutive_errors
                 logger.info("📥 开始接收结果...")
+
                 while True:
-                    result = await self.receive_result()
+                    result = await self.receive_result(timeout=self.receive_timeout_seconds)
                     if result is None:
                         continue
 
@@ -446,17 +524,24 @@ class DoubaoStreamingProcessor:
                             break
                         continue
 
-                    consecutive_errors = 0  # 成功接收，重置错误计数
+                    consecutive_errors = 0
 
-                    # 合并 definite + pending 作为当前全量预览
                     current_text = result.definite_text + result.pending_text
                     if current_text:
                         on_preview_text(current_text)
-                        # 持续更新最终文本（每次都取最新的全量文本）
                         final_text = current_text
 
                     if result.is_final:
-                        logger.info(f"📥 接收完成，共收到 {recv_count} 个结果，最终文本: '{final_text}'")
+                        final_wait = (
+                            time.monotonic() - send_done_at
+                            if send_done_at is not None
+                            else 0.0
+                        )
+                        logger.info(
+                            "📥 接收完成，"
+                            f"final_wait={final_wait:.1f}s，"
+                            f"共收到 {recv_count} 个结果，最终文本: '{final_text}'"
+                        )
                         break
 
             # 并行执行发送和接收
@@ -474,6 +559,8 @@ class DoubaoStreamingProcessor:
         except Exception as e:
             on_error(f"处理失败: {e}")
         finally:
+            elapsed = time.monotonic() - stream_started_at
+            logger.info(f"豆包流式会话耗时: {elapsed:.1f}s")
             await self.disconnect()
 
 
@@ -486,7 +573,7 @@ async def test_streaming(audio_file: str):
     processor = DoubaoStreamingProcessor()
 
     if not processor.is_available():
-        print("请配置 DOUBAO_APP_KEY 和 DOUBAO_ACCESS_KEY 环境变量")
+        print("请配置 DOUBAO_API_KEY，或旧版 DOUBAO_APP_KEY 和 DOUBAO_ACCESS_KEY 环境变量")
         return
 
     # 读取音频文件

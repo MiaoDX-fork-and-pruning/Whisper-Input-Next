@@ -39,7 +39,7 @@ This project is based on [ErlichLiu/Whisper-Input](https://github.com/ErlichLiu/
 ## ✨ Key Features
 
 ### 🔥 NEW in v3.3.0: Two-Pass Recognition & Accuracy Boost
-- **Two-Pass Recognition**: Enables `enable_nonstream` for sentence-level re-recognition using the higher-accuracy nostream model during speech pauses, significantly improving transcription quality
+- **Two-Pass Recognition**: Enabled by default for sentence-level re-recognition using the higher-accuracy nostream model during speech pauses. Set `DOUBAO_ENABLE_NONSTREAM=false` if you prefer lower stop latency.
 - **Deferred Text Output**: All text stays in floating preview during recording; final text is pasted only after recording stops, allowing full ASR context optimization
 - **DJI Wireless Mic Support**: Auto-detects and prioritizes DJI Wireless Microphone as input device
 
@@ -149,9 +149,19 @@ Configure the following parameters in the `.env` file:
 
 ```bash
 # ============ Doubao Streaming ASR (Recommended, Default) ============
-# Get your API keys from Volcengine Console (see screenshot below)
-DOUBAO_APP_KEY=your_app_id_here        # APP ID from console
-DOUBAO_ACCESS_KEY=your_access_token_here  # Access Token from console
+# Official API doc: https://www.volcengine.com/docs/6561/1354869?lang=zh
+# New Volcengine console auth, recommended.
+DOUBAO_API_KEY=your_api_key_here
+
+# Legacy console auth, optional. Leave empty when using DOUBAO_API_KEY.
+DOUBAO_APP_KEY=
+DOUBAO_ACCESS_KEY=
+
+# Doubao Streaming ASR 2.0 only.
+DOUBAO_RESOURCE_ID=volc.seedasr.sauc.duration
+
+# Enabled by default for better final quality. Set false if you prefer lower stop latency.
+DOUBAO_ENABLE_NONSTREAM=true
 
 # Transcription service selection: "doubao" (default, streaming) or "openai" (batch)
 TRANSCRIPTION_SERVICE=doubao
@@ -177,8 +187,9 @@ OPTIMIZE_RESULT=false
 <a id="how-to-get-doubao-api-keys"></a>
 **How to get Doubao API keys**:
 
-1. Go to [Volcengine Console - Speech Recognition](https://console.volcengine.com/ark/region:ark+cn-beijing/tts/speechRecognition)
-2. Find your **APP ID** and **Access Token** in the "服务接口认证信息" section (see screenshot below)
+1. Follow the official [Volcengine Doubao streaming ASR API doc](https://www.volcengine.com/docs/6561/1354869?lang=zh).
+2. Prefer the new console `API Key` and set `DOUBAO_API_KEY`.
+3. If you are still on the legacy console, set `DOUBAO_APP_KEY` and `DOUBAO_ACCESS_KEY`.
 
 <p align="center">
   <img src="assets/images/volcengine_doubao_api_keys.png" alt="Volcengine Doubao API Keys" width="800" />
@@ -313,7 +324,7 @@ python main.py
 ## 📋 Changelog
 
 ### v3.3.0 (2026-03-11)
-- **Two-pass recognition**: Enable `enable_nonstream` for sentence-level re-recognition with nostream model, significantly improving accuracy (e.g. "广告位" → "光标位置")
+- **Two-pass recognition**: Enable sentence-level re-recognition with nostream model by default, following the service's finalization behavior
 - **Deferred text output**: All text stays in floating preview during recording; final text pasted only after stop, allowing full ASR context optimization
 - **DJI Wireless Mic support**: Auto-detect and prioritize DJI Wireless Microphone as highest priority input device
 - **Lower latency**: Reduce streaming chunk size from 200ms to 100ms
